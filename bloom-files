@@ -1,0 +1,498 @@
+#!/bin/bash
+# * BLOOM-FILES - department of false positives
+# a simple bloom filter for disk based bloom maps via the file-system
+# - here filename in b32 carries 5 bits per digit.
+# - symlinks add 60 space, either provides 30x(2xb32) coords (e.g. almost 5b) or 60x8 bytes as bits.
+# - 20 mb hold ~1e7 files& dirs
+#   - representing ~600k (598946) symlinks covering ca 1.2e7 hashes. (half bytes of 2,396,366)
+#   - ~ 1.8byte/hash .. compare to 40..64..128 bytes per unmolested hash!
+#     - 20mb could otherwise hold 163840 128 bit hashes.
+# ** [[elisp:(org-content 2)][d2]] [[elisp:(org-content 3)][d3]] [[elisp:(org-content 4)][d4]] [[elisp:(org-content 5)][d5]]
+# #+STARTUP: headlines
+# #+EXPORT_FILE_NAME: /home/opt/.out/bloom-files
+# ** Part 1 - vars
+
+# *** globals
+hmac="" #"-hmac abc"
+dims=$(( 2**(5*2) ))
+
+path="."
+[ ! -d "$path" ] && { mkdir -p "$path" || exit 99; }
+
+# *** include
+source "shared.bash"
+set-default-flags
+
+# *** verbosity
+declare -i verbose=1;
+isverbose(){ return $verbose; }
+
+# ** Part 2 - helpers
+# *** exit
+declare -i exiting=1
+
+ende(){
+    exiting=0
+    sleep 0.001
+    if [ "$1" = "0" ]; then echo "$2"; else echo "ende: $2."; fi
+    exit "$1"
+}
+
+# **** exit handlerthe exit-handler runs all the snippets you added to =onexit=
+declare -a onexit=()
+onexit_trap(){
+    echo exiting.
+    for code in "${onexit[@]}"; do
+        echo ">$code"
+        eval "$code"
+    done
+}; trap onexit_trap EXIT
+
+# **** sticking around
+linger(){
+    declare -i r="${1:-120}" s="${2:-5}" i=1
+    for ((;i<=r;i++)); do
+        echo "[$i] Sleeping $s seconds.."
+        sleep "$s"
+    done
+    echo
+}
+
+# *** lock
+# we need a master lock so the subshells know when its time to quit processing inputs.
+# its the only atomic operation in here at the moment. there could be addlt locks later.
+
+declare lock="$path/${0##*/}.$$"
+touch "$lock" || exit 99
+onexit+=( "rm $lock" )
+isrunning(){ [ -e "$lock" ]; return $?; }
+isexiting(){ [ ! -e "$lock" ]; return $?; }
+
+# *** file
+# a no-worries fifo-maker that interacts with the =onexit= handlers to clean up afterwards.
+make-fifo(){
+    # $1> name of var to contain the path
+    declare -n fifo="$1"
+    declare fifopath="${2:-}"
+    if [ "${#fifopath}" -eq 0 ]; then
+        if [ -d "$path" ]; then fifopath="$path"; else fifopath="/tmp"; fi; fi
+    fifo="${fifopath}/${1}"
+    [ -e "$fifo" ] && [ ! -p "$fifo" ] && rm -f "$fifo"
+    [ ! -p "$fifo" ] && mkfifo "$fifo"
+    if [ -p "$fifo" ]
+    then  onexit+=("rm -f $fifo")
+    else ende 1 "cant make [$fifo]."
+    fi
+}
+
+# *** stream
+read-string(){
+    declare -n var="$1"
+    var=$(while read -r; do printf "%s\n" "$REPLY"; done)
+}
+
+read-array(){
+    declare -n var="$1"
+    var=( $(while read -r; do printf "%s\n" "$REPLY"; done) )
+}
+
+read-digests(){
+    declare -n var="$1"
+    var=( $(while read -r _ val; do printf "%s\n" "$val"; done) )
+}
+
+# ** Part 3 - features of the machine
+# I've implemented this a bunch of pipes so that the machine can stay up.
+# e.g. arbitrary lines written into the input pipe will get tracked.
+# - a router in front or a pass-through destination-field would make that round.
+# - for the moment, this proves the pudding.
+
+
+# *** reading messages and making digests for them
+# - made to be completely insanely slow by insisting on multiple hashes
+#   - the sane method/person would care about that and just consume a single hash
+#   - but the point is that all the extra time and work done served a point.
+#   - TODO make/consume hashes as if serious ')
+request-digests(){
+    # make digests from the message
+    declare list="" msg="$1"
+    shift
+    list="$*"
+    if [ "${#list}" = "0" ]; then list="md5 sha1"; fi
+    for digest in $list
+    do echo "$msg" | openssl $hmac dgst "-$digest" -hex
+    done
+}
+
+read-messages(){ #set -x
+    # this watches the input
+    declare -i count=0
+    while isrunning; do
+        if isverbose; then echo "read-messages: waiting. $exiting"; fi
+        while read -r; do
+            count=$((count+1))
+            if isverbose; then echo "read-messages: $REPLY"; fi
+            request-digests "$REPLY" >"$fifo_digests"
+        done
+        sleep 1
+    done
+    echo "EXIT: read-messages: $count"
+}
+
+# *** reading digests and converting them to base-32
+# reads all the hashes and changes their bases to compact them
+read-digested(){ #set -x
+    declare -i count=0
+    declare hexv="" b32=""
+    while isrunning; do
+        if isverbose; then echo "read-digested: waiting. $exiting"; fi
+        while read -r _ hexv; do
+            count=$((count+1))
+            if isverbose; then echo "read-digested: $hexv"; fi
+            echo "obase=32; ibase=16; ${hexv^^}"\
+                | BC_LINE_LENGTH=0 bc\
+                | stringlist-as-string64  >"$fifo_b32"
+        done
+        sleep 1
+    done
+    echo "EXIT: read-digested: $count"
+}
+
+# *** reading base-32 results and scheduling them for processing
+# in the heart of the machine,
+# a b32-hash is consumed by a file-name, with a portion of the name stored as/in the symlink field.
+
+read-b32(){ #set -x
+    declare -i count=0 dupes=0 x y
+    declare file=""  b32=""
+    declare data="" bv=""
+    while isrunning; do
+        if isverbose; then echo "read-b32: waiting. $exiting"; fi
+        while read -r b32; do
+            count=$((count+1))
+            if [ $((count % 1000)) -eq 0 ]; then printf "read-b32:%6d%4d %s\n" $count $dupes "$b32"; fi
+            #if isverbose; then echo "read-b32: $b32"; fi
+            if [ "${#b32}" -lt 20 ]
+            then echo "too short [${#b32}]."; continue; fi
+
+            # here is where i pick the odl to play with
+            # file is 'the where, including path'. =bv= is what gets packaged into links.
+            case 3 in
+                1)  bvn=4
+                    file="${b32:0:1}/${b32:1:3}"             # 0/123
+                    bv="${b32:4:$bvn}"                          # 5678
+                    ;;
+                2)  bvn=4
+                    file="${b32:0:1}/${b32:1:2}/${b32:3:3}"  # 0/12/345
+                    bv="${b32:4:$bvn}"                          # 6789
+                    ;;
+                3)  bvn=2
+                    file="${b32:0:2}/${b32:2:2}/${b32:4:2}"  # 01/23/45
+                    bv="${b32:6:$bvn}"                          # 67
+                    ;;
+            esac
+
+            # process the info
+            out="$path/$file"
+
+            # TODO break-out
+            if [ -h "$out" ]; then
+                # get symlink info, if any. trim on assignment.
+                data=$(ls -l "$out" | cut -d\> -f2 )
+
+                # check is new value is already known
+                case $bvn in
+                    2) split=$(echo $data | sed "s|\(..\)|\1 |g" );;
+                    4) split=$(echo $data | sed "s|\(....\)|\1 |g" );;
+                    *) ende 1 "unknown split [$bvn].";;
+                esac
+                if [ "${split//$bv}" != "$split" ]; then
+                    dupes=$((dupes+1))
+                    printf "read-b32:%6d%4d %s\n" $count $dupes "$b32"
+                    continue
+                fi
+                # update data
+                data="$data$bv"
+                # check size
+                if [ "${#data}" -gt 60 ]; then
+                    #https://ext4.wiki.kernel.org/index.php/Ext4_Disk_Layout#Inline_Data
+                    # Symbolic Links: The target of a symbolic link will be stored in this field
+                    # if the target string is less than 60 bytes long. Otherwise, either extents
+                    # or block maps will be used to allocate data blocks to store the link target
+                    # rewrite symlink as file.
+                    printf '%s' "$data" >"$out"
+                    if ! isrvtrue; then ende $rv "printf failed [$out]."; fi
+                else
+                    # update the link
+                    chs-trim data
+                    ln -sf "$data" "$out"
+                fi
+            elif [ -f "$out" ]; then
+                # not a symlink but a file to append to
+                # needs to check is new value is already known
+                # once the size approaches 4k/cluster-size, compact into png.
+                printf '%s' "$bv" >>"$out"
+                if ! isrvtrue; then ende $rv "printf failed [$out]."; fi
+                x=$(stat -c '%s' "$out")
+                if [ "$x" -ge 2000 ]; then
+                    echo "$out: $x bytes."
+                fi
+            else
+                # new entries start as symlinks pointing to $bv
+                mkdir -p "$(dirname $out)"
+                if true; then
+                    ln -sf "$bv" "$out"
+                else
+                    printf '%s' "$bv" >"out"
+                    if ! isrvtrue; then ende $rv "printf failed [$out]."; fi
+                fi
+            fi
+        done
+        sleep 1
+    done
+    echo "EXIT: read-b32: $count dupes:$dupes"
+}
+
+# *** reading file-processing instructions and doing something with them
+
+# superfluous
+#  #+begin_src sh
+# read-drawings(){ set -x
+#     declare -i count=0 x y
+#     declare file="" out=""
+#     while isrunning; do
+#         if isverbose; then echo "read-drawings: waiting."; fi
+#         while read -r; do # file x y;
+#            count=$((count+1))
+#            if isverbose; then echo "read-drawings: $REPLY"; fi
+#             # do  out="$path/$file"
+#             #     echo "read-drawings: $b32 -> $file  $x $y"
+#             #     mkdir -p "$(dirname $out)"
+#             #     printf '%d,%d\n' "$x" "$y" >>"${out}.in"
+#             #     x=$(stat -c '%s' "${out}.in")
+#             #     if [ "$x" -ge 2000 ]; then
+#             #         echo "${file}.in: $x bytes."
+#             #     fi
+#         done
+#         sleep 1
+#     done
+#     echo "EXIT: read-b32: $count"
+# }
+# #+end_src
+
+# ** Part 4 - build and use the machine
+# *** hook-up the stream-processors
+# the parts to turn the parts into a machine.
+# stream interop channels
+declare fifo_messages
+declare fifo_digests
+declare fifo_b32
+declare fifo_drawings
+
+initialize(){
+    make-fifo fifo_messages
+    make-fifo fifo_digests
+    make-fifo fifo_b32
+    make-fifo fifo_drawings
+    # hook them up and let them run in the background
+    read-messages <"$fifo_messages" &
+    read-digested <"$fifo_digests" &
+    read-b32      <"$fifo_b32" &
+    read-drawings <"$fifo_drawings" &
+}
+
+# *** add-work to the machine
+write(){ echo "$1" > "$fifo_messages"; }
+# old
+#new(){ write "$(( RANDOM*RANDOM ))"; sleep 0.001; } # ~ 128 dupes/200k '2^32'
+# and new randomixer
+new(){ write "$(( RANDOM*RANDOM*RANDOM*RANDOM\
+                 +RANDOM*RANDOM*RANDOM\
+                 +RANDOM*RANDOM\
+                 +RANDOM ))"; sleep 0.001; }
+
+# *** bloom-files-by-stream()
+# the programming here was about the stream-machine as much as it was about the
+# data-processing. for testing this was more fun than ideal yet it makes the whole
+# thing to be what it is: unfinished. but we get to see the machine run out of work
+# and can see that it handles huge loads with aplomb. that was important too.
+
+#set -x
+set-random-sigs(){ declare -i i; keep=1; for ((i=0;i<$1;i++)); do new; done; }
+get-random-sigs(){ declare -i i; keep=0; for ((i=0;i<$1;i++)); do new; done; }
+
+#render-randomness
+#read-randomness | summarize
+#feh "$fname" &
+
+bloom-files-by-stream(){
+    echo "The bloom field database at ${path} is getting $1 new records"
+    initialize
+    set-random-sigs "$1"
+    linger 120 5
+    #get-random-sigs    echo
+}
+
+# *** 'known'
+
+b32-to-fname(){
+    declare b32
+    read -r b32
+    echo "$b32" 1>&2
+    echo "$path/${b32:0:2}/${b32:2:6}"  # 01/23456
+
+}
+hash-to-b32(){
+    declare hash
+    read -r hash
+    echo "$hash" 1>&2
+    echo "obase=32; ibase=A; ${hash}"\
+        | BC_LINE_LENGTH=0 bc\
+        | stringlist-as-string64
+}
+
+bloom-known(){
+    declare hash len fn
+    set +m
+    shopt -s lastpipe
+    echo "$1" | cksum | read -r hash len
+    echo "$hash" | hash-to-b32 | b32-to-fname | read fn
+    echo "$1: $len: $hash"
+    [ -e "$fn" ]
+    echo "known: $? -- $fn"
+}
+
+bloom-known "$1"
+debugoff
+ende 0 "done."
+
+
+# ** Part 5 - older/shell-things
+# *** old/initial org-mode integration
+##########################################################3
+
+#set-pixel $file $x $y
+#if [ ! -d "$root" ]; then mkdir -p "$root" || ende 99 error; fi
+#assert-image "$file" "$dims" "$dims" "$frmt" $cols
+declare b32="" root="" file=""
+
+frmt="png8"
+cols=1
+
+# *** b32fname
+b32fname(){
+    root="$path${b32:0:1}"
+    file="$root/${b32:1:3}"
+    if [ ! -d "$root" ]; then mkdir -p "$root" || ende 1 error; fi
+}
+
+# *** base-32
+# klunky value extractor.
+b32val() {
+    # $> takes name of a variable ($1)
+    #  and assigns value of $2's two-leading digits as base ${3:-32}
+    declare -n v="$1"
+    declare s=$2
+    declare -i i v
+    v=${r64[${s:0:1}]}
+    i=${r64[${s:1:1}]}
+    v=$(( v*${3:-32} + i ))
+}
+
+# *** incoming()
+incoming(){ ##$> fifo message
+    if [ "${#1}" = "0" ]; then return 1; fi
+    if [ "${#2}" = "0" ]; then return 1; fi
+    request-digests "$2" >"$1" &
+    declare -a hex=()
+    read-digests hex <"$1"
+
+    declare -i i n=${#hex[@]} new=0 x y rv
+    for ((i=n-1;i>=0;i--)); do
+        hv="${hex[$i]}"; hv="${hv^^}" #; echo "$i $hv"
+        # echo -n "dec: "
+        # echo "ibase=16; $hv" | BC_LINE_LENGTH=0 bc
+        # echo "hex: $hv"
+        # echo -n "b64: "
+        # stringlist-as-string64 "$( echo "obase=64; ibase=16; $hv" | BC_LINE_LENGTH=0 bc )"
+        # echo -n "b32: "
+        echo "obase=32; ibase=16; $hv" | BC_LINE_LENGTH=0 bc | stringlist-as-string64 >"$1" &
+        read-string b32 <"$1"
+        # echo "$b32"
+        #echo "f32: ${b32:0:1}/${b32:1:3}:${b32:4:2},${b32:6:2} == ${b32:8:2}${b32:10:2}${b32:12}"
+        #echo "f32: ${b32:0:1}/${b32:1:3}/${b32:4:4}:${b32:8:2},${b32:10:2} == ${b32:12}"
+        b32fname
+        if [ "$keep" = "0" ]; then
+            if [ ! -e "$file" ]; then new=$((new+1)); continue; fi
+        else
+            assert-image "$file" "$dims" "$dims" "$frmt" $cols
+        fi
+        b32val x 4
+        b32val y 6
+        #echo -n "get-pixel $file $x $y "
+        get-pixel $file $x $y; rv=$?  #; echo $rv
+        if [ "$rv" = "0" ]; then
+            if [ "$keep" != "0" ]; then set-pixel $file $x $y; fi
+            new=$((new+1))
+        fi
+        # echo "f32: $file" "$dims" "$dims" "$frmt"
+        #  set -x  set +x
+        # echo -n "get-pixel $file $x $y "
+        #      ispixelset $file $x $y; echo -n "$? "
+        #      get-pixel $file $x $y; echo $?
+        # echo set-pixel $file $x $y white
+        #      set-pixel $file $x $y white
+        # echo -n "get-pixel $file $x $y "
+        #      ispixelset $file $x $y; echo -n "$? "
+        #      get-pixel $file $x $y; echo $?
+        # echo set-pixel $file $x $y 127
+        #      set-pixel $file $x $y 127
+        # echo -n "get-pixel $file $x $y "
+        #      ispixelset $file $x $y; echo -n "$? "
+        #      get-pixel $file $x $y; echo $?
+    done
+    return $((n-new))
+}
+
+# *** one-liners
+
+# **** find number of files etc
+#count files/dirs
+find /ram/bloom -type d|wc -l
+find /ram/bloom -type l|wc -l
+find /ram/bloom -type f|wc -l
+
+# for ex: after adding 200k items into 01/23/45>67 (2^40 bits)
+# find /ram/bloom -type d|wc -l  -- 172590
+# find /ram/bloom -type f|wc -l  --      0
+# find /ram/bloom -type l|wc -l  -- 199842
+
+# compare to 0/123/456>7   (40bits fully contained in symlinks; more w higher bases!)
+
+# **** eval symlink utilization
+for l in /ram/bloom/??; do ls -l $l/?? | grep -e ">" | cut -d\> -f2; done | wc
+
+# after 200k:  199842  199842  799428
+# 199842 lines with single words. ok, w found all the files.
+# 799428 bytes used in symlinks. 2b each-> ~400k references. e.g. 200k w 2 hashfuncts. ok!
+
+# source had ~32bit entropy from ~16bit $RANDOM, there were 100% 128 dupes.
+
+# because the hash became two it follows that there were 158-128=30 'half-positives'
+# in the set where one half matched another exactly. that's actually spectacular.
+
+# REVIEW! that impression by contrasting it with an analysis of what PNGs show.
+
+# **** more
+##
+## print links for a 01/23/45>67 layout.
+for i in x??; do ls -l $i/?? | awk -e ' { if (length($11)>2) print "->",$11 }' ; done
+
+## space used by dirs in a 0/12/345>6789 layout
+ls -l x?? | awk -e ' { t=t+$5 } END {print t} '
+
+## print space used by a 01/23/45>67 layout.
+for i in x??; do ls -l $i/?? | awk -e '{t=t+$5} END {print t}'; done | awk -e '{t=t+$1} END {print t}'
+
+# ** qed.                                                 :ignore:
+# ∎

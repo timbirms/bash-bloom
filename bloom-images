@@ -1,0 +1,609 @@
+#!/bin/bash
+# * BLOOM-IMAGES - department of false positives
+# shell based bloom image generator
+# - stashes 8 or 32 bits into the colors of pngs.
+#   - 2^ 5x5x5bits =32kbits +1000 items, 2 1byte hashes each -> 1.72kb 0.3%fpr/285 steps to collision.
+#   - 2^ 5x5x5bits =32kbits +1000 items, 4 1byte hashes each -> 3.16kb 0.3%fpr/5735 steps to collision.
+# - read and write sets up a few thousand pixels per op.
+#   - TODO rendering points in color-order to be finished before more points
+#   - also piping this elsewhere to have arb-size batches written
+# ** [[elisp:(org-content 2)][d2]] [[elisp:(org-content 3)][d3]] [[elisp:(org-content 4)][d4]] [[elisp:(org-content 5)][d5]]
+# #+STARTUP: headlines
+# #+EXPORT_FILE_NAME: /home/opt/.out/bloom-images
+# ** Part 1 - vars
+# *** includes
+#source /home/opt/ubin/kvdb
+
+# *** names and paths
+declare frmt='png'
+
+declare path='.'
+[ ! -d "$path" ] && mkdir -p "$path"
+
+declare monitor="${path}bloom.png"
+
+# *** defaults
+declare -i keep=0 # keep results
+declare -i verbose=1 # not so verbose
+
+isverbose(){ return $verbose; }
+
+logger(){ echo "$1" >&2; }
+
+# **** for testing repeatable sequences
+# set randseed if you want to control the data a bit
+#declare -i randseed=0
+
+# ** Part 2 - image processing
+# *** imagemagick
+# routine to handle most calls to imagemagic
+# offering rv-testing and aborts on error.
+image(){
+    declare name="$1"; shift
+    #echo convert "${@}"
+    convert "${@}"
+    if ! isrvtrue; then
+        echo "convert ${@}"
+        ende 1 "trouble $name [$1]."; fi
+}
+# *** file test/create
+# check for presence of file and create from params if needed.
+image-create(){
+    #https://poizan.dk/blog/2014/02/28/monochrome-images-in-imagemagick/
+    # e=png; convert -size 512x512 -monochrome -colors 1 xc:black x.$e ; identify x.$e
+    if isverbose; then echo "create-image $1"; fi
+    declare c="${6:-"-monochrome -colors $4 xc:black"}"
+    declare e=${5}; if [ "$e" = "png1" ]; then e="png"; fi
+	#shellcheck disable=SC2086
+    image "making" -size "${2}x${3}" $c "$e:$1"
+}
+image-assert(){
+    if isverbose; then echo "assert-image $1"; fi
+    if [ -e  "$1" ] && [ "$keep" -eq 0 ]; then return; fi
+    image-create "$1" "$2" "$3" "$4" "$5" "$6"
+}
+
+
+# *** reading and writing of pixels
+# this translates a stream of colors output by imagemagic into numbers
+# - TODO needs to understand 32 bit hex colors
+
+get-pixel-color(){
+    declare color=""
+    declare -i n=0
+    while read color; do
+        n=$((n+1))
+        #echo "$color"; continue
+        case "$color" in
+            black) echo 0;;
+            white) echo 1;;
+        *)  if [ "${color//gray}" != "$color" ]; then
+                color="${color//gray(}"
+                color="${color//)}"
+                if [ "${#color}" -gt 0 ]
+                then echo $((color))
+                else echo "unknown color [$color]."; fi
+            else echo "unknown color [$color]."; fi
+        ;; esac
+    done
+    if [ $n -eq 0 ]; then echo "nothing color"; fi
+}
+
+# generates a stream with one or more color values
+get-pixel(){
+    # read 1..8 bit color from file
+    # $> fname x y
+    # $> fname array-of-points-name
+    if [ "${#3}" -eq 0 ]
+    then declare -n a="$2"
+    else declare -a a=( "%[pixel:p{$2,$3}]" )
+    fi; image "reading" "$1" -format "${a[*]}" info:
+} #
+
+# writes a single 8bit or n-nbit colored pixels to an image
+set--pixel(){
+    # write 1..8 bit color to file
+    # $> fname value x y z
+    # $> fname value array-of-points-name
+    declare color="${2:-white}"
+    case "$color" in black|white ) : ;; *) color="gray($color)" ;; esac
+    #
+    if [ "${#4}" -eq 0 ]
+    then declare -n a="$3"
+    else declare -a a=( "point $3,$4" )
+    fi; image "updating" "$1" -draw "fill ${color} ${a[*]}" "$1"
+}
+
+# *** access functions
+
+# single color set-pixel wrappers with params ordered for use
+# these have the largest 'net' capacity for points since they are 'fixed color'.
+# a bulk-writer would usually group pixels into color bins and compbine them
+# to write. this is not that.
+# $> file, color [array|x,y]
+set-pixel(){ set--pixel "$1" "${4:-white}" "$2" "$3" ; }
+clear-pixel(){ set--pixel "$1" "${4:-black}" "$2" "$3"; }
+
+#ispixelset(){ if get-pixel "$1" "$2" "$3"; then return 1; else return 0; fi; }
+
+# **** early random-data testing
+# obsolete in the current regime.
+
+randomxy(){
+    x="$((RANDOM % dims))"
+    y="$((RANDOM % dims))"
+}
+
+set-pixels-randomly(){
+    # $> fname count
+    declare -a a=()
+    declare -i i x y
+    for ((i=0;i<$2;i++)); do randomxy; a+=("point $x,$y"); done
+    set-pixel "$1" a
+}
+
+get-pixels-randomly(){
+    # $> fname count
+    declare -a a=()
+    declare -i i x y
+    for ((i=0;i<$2;i++)); do randomxy; a+=("%[pixel:p{$x,$y}]"); done
+    get-pixel "$1" a
+}
+
+summarize(){ cat | tr " " "\n" | sort | uniq -c; }
+
+
+# ** Part 3 - blooming pngs
+# *** kvdb_bloom()
+
+# **** vars
+
+# ***** array for image-processing commands. up to {x?}k chars cmdline.
+declare -a setmap=() getmap=()
+
+# ***** a bit-mask showing, from r2l, 0..32 bits.
+# this is used to divy up the bits from an incoming hash
+declare -a mask=()
+for ((i=0;i<=32;i++)); do mask+=($((2**i -1))); done
+#declare -p mask
+
+# **** random inputs.
+# ***** pump-bits.ugh.
+# RANDOM is 16 bits. here its expanded to 3x + 2x +1x
+# this guarantees nothing but it spreads 16 -> 48 bits.
+# use a plot* function to drive the pump.
+pump-48b(){
+    declare -i i=0 n=${1:-0}
+    for ((;i<n;i++)); do
+        echo "$((RANDOM*RANDOM*RANDOM+RANDOM*RANDOM+RANDOM))"
+    done
+}
+# ***** plot-repeatable()
+# starting from a default seed
+
+plot-repeatable(){
+    logger "plot-repeatable $n"
+    RANDOM=${2:-$randseed}
+    pump-48b $1
+}
+
+# ***** plot-random()
+# nanoseconds > randseed
+
+plot-random(){ declare -i i=0 n=${1:-0}
+    logger "plot-random $n"
+    read -r RANDOM <<< "$(date +'%N')"
+    pump-48b $1
+}
+
+# **** hashes-to-actions()
+# ***** hash-l()
+# consumes =$msk= bits from the input and maskes the result with them.
+hash-l(){
+    declare -i msk="$1"
+    declare -n inp="$2"
+    declare -n res="$3"
+    res=$(( inp & ${mask[$msk]} ))
+    inp=$(( inp >> msk ))
+}
+
+# ***** hashes-to-actions()
+# work ahead of time
+# transforms the input stream of hashes into matching sets of read and write commands.
+# these commands are not executed here, they are simply made.
+# this is tooo atomic;
+# - TODO .. almost .. allow color-setting code to merge/know/read-before write.
+# - refact hashing and color post-processing
+hashes-to-actions(){
+    # render the points from bits2coords, now in map{x,y} stringlists, into plotable form.
+    declare -i x=${1:-5}
+    declare -i y=${2:-5}
+    declare -i z=${3:-8}
+        if [ "$x" = "nil" ]\
+        || [ "$y" = "nil" ]\
+        || [ "$z" = "nil" ]; then return 1; fi
+    declare -i nfunc=${4:-2}
+    declare -i nlim=${5:-10000}
+
+    logger "hashes-to-actions $x $y $z ${nlim//10000}"
+    declare hash16
+    declare -i h l m
+    declare temp c
+    declare -A tmp=()
+    for ((;nlim>0;nlim--)); do
+        read hash16 || break
+        if [ $z -eq 0 ]; then
+            # monochrome
+            hash-l $x hash16 l
+            hash-l $y hash16 h
+            setmap+=("point ${h},${l}")
+        else
+            # color. wants an intermediate bucket-spreader
+            # not checking if we're running out of bits at all.
+            declare v=$hash16
+            hash-l $x hash16 h
+            hash-l $y hash16 l
+            hash-l $z hash16 m
+            txt="point ${h},${l}"
+            idx="${h} ${l}"
+            temp="${tmp[$idx]}"
+            temp=$((temp | 1 << $m ))
+            tmp["$idx"]="$temp"
+
+            if [ "$nfunc" -eq 4 ]; then
+                #repeat. dreadful. i know.
+                hash-l $x hash16 h
+                hash-l $y hash16 l
+                hash-l $z hash16 m
+                txt="point ${h},${l}"
+                idx="${h} ${l}"
+                temp="${tmp[$idx]}"
+                temp=$((temp | 1 << $m ))
+                tmp["$idx"]="$temp"
+            fi
+        fi
+        #printf '%3d %3d\n' $h $l
+        getmap+=("%[pixel:p{${h},${l}}]" )
+    done
+    # monochrome is done
+    if [ $z -eq 0 ]; then return 0; fi
+    # for color,
+    # we've turned incoming bits into pixel colors in the last step
+    # here we transform that list into one listing pixel coords by color.
+    # this save outputting repetative '-fill "#color"' strings.
+    # TODO - almost there. needs group level optim in t2 loop,.
+
+    #declare -p tmp #setmap
+    declare -a t=()
+    for temp in "${!tmp[@]}"; do
+        #echo "@: $temp= ${tmp[$temp]}"
+        read h l <<<"$temp"
+        m="${tmp[$temp]}"
+        if [ "$m" = "0" ]
+        then c="black"
+        else
+            if [ $z -eq 0 ]
+            then c="gray($m)"
+            else
+                m=${m^^}
+                m=${m:0:6}
+                i=${#m}
+                a="$(printf '%d' $m)"
+                for ((;i<6;i++)); do a=0"$a"; done
+                c="#$(echo $a)"
+            fi
+        fi
+        t+=( ["$c"] "-fill \"${c}\" -draw \"point ${h},${l}\" " )
+    done
+
+    t2="$(echo "${!t[@]}" | tr " " "\n" | sort)"
+    for temp in $t2; do
+        setmap+=( ${t[$temp]} )
+    done
+
+    return
+}
+
+# *** bloom-files
+bloom-name(){
+    # complicated filenames for everyone!
+    declare -n var="$1"
+    declare -i xbits=${2:-5}
+    declare -i ybits=${3:-5}
+    declare -i zbits=${4:-8}
+    declare    fmt=${5:-"$frmt"}
+    var="${path}bloom.$xbits.$ybits.$zbits.$fmt"
+}
+
+# *** bloom-draw()
+bloom-draw(){
+    #logger "bloom"
+    # make and render
+    # makes a pgn to hold a bloom
+    # then renders a list of drawing instructions into it
+    # and links the result to the viewer can update itself.
+    declare keep=0; if [ "$1" = "-r" ]; then shift; keep=1; fi
+    # $> bloom reads a stream of hashes for processing.
+    # it takes up to 6 parameters. 3 of which you care about.
+    declare -i xbits=${1:-5}
+    declare -i ybits=${2:-5}
+    declare -i zbits=${3:-8}
+    declare -i nbits=$((xbits+ybits+zbits))
+    declare -i  nlim=${4:-10000}
+    declare -i nfunc=${5:-2}
+    declare      fmt=${6:-"$frmt"}
+    declare fname;  bloom-name fname $xbits $ybits $zbits "$fmt"
+    #
+    # bloom uses a given path and decides on all the filenames for the job.
+    # render setmap into a new image
+
+    [ $keep -ne 0 ] && [ -e "${fname}" ] && rm "$fname"
+    image-assert "${fname}" "$((2**xbits))" "$((2**ybits))" "$((2**zbits))" \
+                 "${fmt}$((2**zbits))" "-colors $((2**zbits)) xc:black"
+                 #"${fmt}$((2**zbits))" "-monochrome -colors $((2**(2**zbits))) xc:black"
+
+    if [ $zbits -eq 0 ]; then
+        # easy peasy. no worries about quoted arguments with a mono map.
+        image "drawing" "${fname}" -draw "fill white ${setmap[*]}" "${fname}"
+    else
+        # eval $val. yes. this is exacly what its made for:
+        # setmap brings in quoted strings which are params.
+        #  they would be re-tokenized if we were to exec "$val" any other way.
+        eval "convert ${fname} ${setmap[*]} ${fname}"
+    fi
+    monitor-bloom "$fname" $xbits $ybits $zbits "$fmt" 500
+}
+
+# *** bloom-doc()
+# **** bit-usage-helper
+# to work out just how many bits are set/free in our structure we
+# resort to generating counts based on the hex-digits in the color code.
+# https://en.wikipedia.org/wiki/Hamming_weight .. ignoring. using lookup.
+declare -A missing=( # 0 8421 3569AC 7BDE F
+    ["0"]=4
+    ["1"]=3    ["2"]=3    ["4"]=3    ["8"]=3
+    ["3"]=2    ["5"]=2    ["6"]=2    ["9"]=2    ["A"]=2    ["C"]=2
+    ["7"]=1    ["B"]=1    ["D"]=1    ["E"]=1
+    ["F"]=0
+)
+
+# **** bloom-doc()
+# print me stats stat!
+bloom-doc(){
+    logger "bloom-doc $*"
+    declare fname="$1"
+    declare -i xbits=${2:-5}
+    declare -i ybits=${3:-5}
+    declare -i zbits=${4:-8}
+    declare -i nbits=$((xbits+ybits+zbits))
+    declare -i area=$((2**nbits))
+    declare -i nfunc=${5:-2}
+    declare -i points=${6:-1}
+    declare -i b w p q
+    declare fpr fpn s f id size
+
+    # start wih  a regular histogram
+    histo=$(image "histogramming" "${fname}" -format "%c" histogram:info:-)
+    echo -e "$histo\n"
+
+    # now get bit-counts from color-values.
+    b=0
+    u=0
+    while read num hex; do
+        # add the number of bits missing from each digit into a total z
+        if [ $zbits -eq 0 ]; then
+            if [ "${hex:0:2}" != "00" ]; then b=$((b+num)); fi
+        else
+            declare -i m="${#hex}"
+            case $zbits in
+                3) n=2;; # back..
+                5) n=6;;
+                *) n=0;; # none
+            esac
+            s=$((m-n))
+            for ((i=0;i<n;i++)); do
+                p=$((s+i))
+                c="${hex:$p:1}"
+                #echo  ${missing[$c]}
+                b=$(( b+ (num * ${missing[$c]}) ))
+                u=$(( u+ (num * (4-${missing[$c]})) ))
+            done
+        fi
+        #echo "$num $hex $n $b $u"
+    done <<<$(echo "$histo" | sed "s|[ ]*\(.*\):.*#\(.*\) .*|\1 \2|g")
+    if [ "$zbits" = "0" ]
+    then bw=$b; bb=$((area-bw))
+    else bw=$u; bb=$((area-bu))
+    fi
+    if [ "$w" = "0" ]
+    then w=1
+    fi
+
+    # however ... all these bits represent exactly $points data-points.
+    w=${points}
+
+    # compute the false-positive rate
+    ## (1- e^(- hashfuncts * hasheditems / bitsinspace ))^hashfuncts
+    fpf="$w/2^$nbits" # less percentage filled == percentage remaining
+    fpf="(1-e(-$nfunc*$fpf))^$nfunc" # next value's chance of hash-collision.
+    fpr=$(bc -l <<<"scale=10;$fpf") # n-1 good digits
+    # and the inverse as well.
+    fpn=$(bc -l <<<"scale=2;1/$fpr") # steps hash-collision expected within
+    # cleanup string
+    [ "${fpr:1:1}" = "0" ] && fpr=". ${fpr:2}"
+
+    # format into statistics
+    # evaluate histogram-summary
+    printf 'avg distance btwn collisions= %s steps. fpr= %s.%s%%\n' $fpn ${fpr:1:2} ${fpr:3:3}
+    echo -n "space w 2^$nbits has area $area. set/dark: $bw/$bb. "
+    echo "data-ratio is $w/$area. $(bc <<<"scale=1; 100*$w/$area")% full."
+    echo "$fpf= $fpr"
+
+    # print image identity-info of the bloom
+    id="$(identify "${fname}")"
+    echo "$id"
+    size="$(awk -e '{print $8}' <<<"$id" | tr -d 'B')"
+    printf 'bytes: blooms: u32:%s, png:%s, 32b-hashes:%d\n' "$(( 2**(xbits*ybits) *4 ))" "${size}" "$((w*4))"
+}
+
+# *** bloom-read()
+
+bloom-read(){
+    # read bit-sets aka color values from a bloom file.
+    declare -i xbits=${1:-5}
+    declare -i ybits=${2:-5}
+    declare -i zbits=${3:-8}
+    declare      fmt=${4:-"$frmt"}
+    declare fname;  bloom-name fname $xbits $ybits $zbits "$fmt"
+    declare -n colors="$5"
+    declare -i into="${6:-8}"
+    # get color values of getmap into pcolors array
+
+    # initially just get the pixel colors as a \n delimited stream.
+    declare color
+    color="$(get-pixel "${fname}" getmap | tr " " "\n")"
+
+    # now read the stream and do something with it
+    # read it into a list of usable color
+    #  declare cols; cols=$(get-pixel-color <<<$(echo -e "$color"))
+    # read colors straight into an array. (with the \n's removed, thats a natural fit.)
+    read -a colors <<<$(get-pixel-color <<<$(echo -e "$color")| tr "\n" " ")
+    #declare -p colors
+
+    # anticipate slurping the 8/32 into u64 lzh'd raws.
+    # just a small test idea
+    if [ "$into" -gt 1 ]; then
+        declare -i v=0 m=0 i=0 n="${#colors}"
+        declare -a rebased=();
+        while [ $i -lt $n ]; do
+            v=${colors[$i]}
+            i=$((i+1))
+            m=$into
+            while [ $m -gt 1 ]; do
+                v=$((256*v+${colors[$i]}))
+                i=$((i+1))
+                m=$((m-1))
+            done
+            #echo "$v"
+            rebased+=($v)
+        done
+        declare -p rebased
+        exit
+    fi
+set +x
+}
+
+# ** Intermezzo -- exit when sourced
+# if we were sourced; then we're done here.
+[[ $0 != "${BASH_SOURCE[0]}" ]] && return 0
+
+
+# ** Part 3 - Test
+#  plot-repeatable | totable | sort | uniq -c | awk -e '{ print $2," ",$3," ",$1 }'  | sort -g
+
+# *** monitor-bloom()
+# allows me to have ristretto auto-refresh-view the most recent bloom at a decent size.
+monitor-bloom() {
+    # create a viewable version of the file
+    # NOTE: ridic params.. just splice in the size. no need to know.
+    declare    bloom="$1" out=""
+    declare -i xbits=${2:-5}
+    declare -i ybits=${3:-5}
+    declare -i zbits=${4:-8}
+    declare      fmt=${5:-"$frmt"}
+    declare -i   siz=${6:-500}
+
+    bloom-name out $xbits $ybits $zbits "$siz.$fmt"
+    if isverbose; then echo "$out  - $((xbits+ybits+zbits)) » $((2**(xbits+ybits+zbits)))"; fi
+
+    # resize has to use a box-filter
+    # TODO for viewing i might also want to normalize the color-space. explore.
+    image "resizing" "${fname}" -filter box -resize $siz "$out"
+
+    # symlink the new file into monitoring
+    rm "${monitor}"
+    ln -s "$out" "${monitor}"
+    if isverbose; then echo "${monitor} » $out"; fi
+}
+
+# *** test()
+test() {
+    logger "test $*"
+    # test 1/8/32 bit bloom images.
+    declare keep=0; if [ "$1" = "-r" ]; then shift; keep=1; fi
+    declare -i xbits=${1:-5}
+    declare -i ybits=${2:-5}
+    declare -i zbits=${3:-0}
+    # restrain  bit-depth input
+    if [ "$zbits" -gt 3 ]; then zbits=5; else if [ "$zbits" -gt 0 ]; then zbits=3; else zbits=0; fi; fi
+    declare -i nfunc=${4:-2}
+    declare      fmt=${5:-"$frmt"}
+    # make name for a file to work with
+    declare fname;  bloom-name fname $xbits $ybits $zbits "$fmt"
+    declare -i nbits=$((xbits+ybits+zbits))
+
+    # aim at testing up to a reasonable inputs= area/10
+    # which is the edge at which the fpr starts going ape.
+    # /10 works. also -4 bits gives good results
+    declare -i limit=$((2**(nbits)))
+    limit=$((limit/10))
+    # and a hard-limit on top
+    [ $limit -gt 1000 ] && limit=1000
+    #limit=100
+
+    doc() {
+        # $> plotter, limit
+        # generate/plot us an input stream
+        declare input; input="$($1 ${2:-$limit})"
+        # and make coordinate-actions for it.
+        hashes-to-actions $xbits $ybits $zbits $nfunc $limit <<<$input
+
+        # pick and doc the file for these inputs.
+        # this is a test. so if the file's aready there,
+        # then we just called hashes-to-actions for 'testing' only.
+        [ $keep -ne 0 ] && [ -e "${fname}" ] && rm "$fname"
+        [ ! -e "${fname}" ] && bloom-draw $xbits $ybits $zbits $limit $nfunc $fmt
+
+        # <read/update data from file with setmap from hashes-to-actions here.>
+
+        # ok, with a file, lets run the stats
+        echo
+        bloom-doc "${fname}" $xbits $ybits $zbits $nfunc $limit
+        echo
+    }
+
+    #doc plot-repeatable $limit
+    doc plot-random $limit
+
+    # read the colors of the hashes per getmap
+    if [ "$zbits" -gt 1 ]; then return; fi # except for 32b.
+    declare -a rcolor=()
+    bloom-read $xbits $ybits $zbits $fmt rcolor 1
+    declare -p rcolor
+}
+
+# #+results:
+
+# *** drive()
+drive(){
+    if [ "$1" = "-r" ]; then o="$1"; shift; else o=""; fi
+    case $1 in
+        22) test $o 2 2 $2 $3 png;;
+        33) test $o 3 3 $2 $3 png;;
+        55) test $o 5 5 $2 $3 png;;
+        88) test $o 8 8 $2 $3 png;;
+    esac
+}
+# *** main()
+main(){
+    test -r 3 2 0
+    # drive -r 22 3 4
+    #
+    # after the test has run, insure that i see the viewer and get my editor into focus again.
+    jumpapp ristretto "${monitor}"
+    jumpapp emacs
+}
+main
+
+# ** qed.                                                 :ignore:
+# ∎
